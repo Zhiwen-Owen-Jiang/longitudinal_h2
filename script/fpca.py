@@ -3,15 +3,13 @@ import logging
 import h5py
 import numpy as np
 import pandas as pd
-import concurrent.futures
 import scipy.sparse as sp
 from tqdm import tqdm
-from functools import partial
 from script.utils import inv
 from scipy.sparse import csc_matrix, csr_matrix, dok_matrix, hstack, eye
 from sklearn.decomposition import IncrementalPCA
 from scipy.interpolate import make_interp_spline
-from image import ImageManager
+from script.image import LongitudinalImageManager
 
 
 class KernelSmooth:
@@ -24,7 +22,7 @@ class KernelSmooth:
         """
         self.images = images
         self.coord = images.coord
-        self.n = images.n_sub
+        self.n = images.n_images
         self.N, self.d = self.coord.shape
         self.logger = logging.getLogger(__name__)
 
@@ -48,14 +46,13 @@ class KernelSmooth:
     def smoother(self):
         raise NotImplementedError
 
-    def gcv(self, bw_list, threads, temp_path):
+    def gcv(self, bw_list, temp_path):
         """
         Generalized cross-validation for selecting the optimal bandwidth
 
         Parameters:
         ------------
         bw_list: a array of candidate bandwidths
-        threads: number of threads
         temp_path: temporay directory to save a sparse smoothing matrix
 
         Returns:
@@ -70,10 +67,10 @@ class KernelSmooth:
             self.logger.info(
                 f"Doing generalized cross-validation (GCV) for bandwidth {np.round(bw, 3)} ..."
             )
-            sparse_sm_weight = self.smoother(bw, threads)
+            sparse_sm_weight = self.smoother(bw)
             if sparse_sm_weight is not None:
                 mean_sm_weight_diag = np.sum(sparse_sm_weight.diagonal()) / self.N
-                mean_diff = self._calculate_diff_parallel(sparse_sm_weight, threads)
+                mean_diff = self._calculate_diff_parallel(sparse_sm_weight)
                 score[cii] = mean_diff / (1 - mean_sm_weight_diag + 10**-10) ** 2
 
                 if score[cii] == 0:
@@ -110,18 +107,15 @@ class KernelSmooth:
 
         return sparse_sm_weight
 
-    @staticmethod
-    def _calculate_diff(images_, sparse_sm_weight):
-        return np.sum((images_ - images_ @ sparse_sm_weight.T) ** 2)
-
-    def _calculate_diff_parallel(self, sparse_sm_weight, threads):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = [
-                executor.submit(self._calculate_diff, images_, sparse_sm_weight)
-                for images_, _ in self.images.image_reader()
-            ]
-            diff = [future.result() for future in futures]
-        mean_diff = np.sum(diff) / self.n
+    def _calculate_diff_parallel(self, sparse_sm_weight):
+        """
+        Calculating MSE for the smoothed images
+        
+        """
+        mean_diff = 0 
+        for images_, _ in self.images.image_reader():
+            mean_diff += np.sum((images_ - images_ @ sparse_sm_weight.T) ** 2)
+        mean_diff /= self.n
 
         return mean_diff
 
@@ -158,14 +152,13 @@ class KernelSmooth:
 
 
 class LocalLinear(KernelSmooth):
-    def smoother(self, bw, threads):
+    def smoother(self, bw):
         """
         Local linear smoother
 
         Parameters:
         ------------
         bw (dim, 1): bandwidth for dim dimension
-        threads: number of threads
 
         Returns:
         ---------
@@ -174,20 +167,9 @@ class LocalLinear(KernelSmooth):
         """
         sparse_sm_weight = dok_matrix((self.N, self.N), dtype=np.float32)
 
-        partial_function = partial(self._sm_weight, bw)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = {
-                executor.submit(partial_function, idx): idx for idx in range(self.N)
-            }
-
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    idx = futures[future]
-                    sm_weight, large_weight_idxs = future.result()
-                    sparse_sm_weight[idx, large_weight_idxs] = sm_weight
-                except Exception as exc:
-                    executor.shutdown(wait=False)
-                    raise RuntimeError(f"Computation terminated due to error: {exc}")
+        for idx in range(self.N):
+            sm_weight, large_weight_idxs = self._sm_weight(bw, idx)
+            sparse_sm_weight[idx, large_weight_idxs] = sm_weight
 
         nonzero_weights = np.sum(sparse_sm_weight != 0, axis=0)
         if np.mean(nonzero_weights) > self.N // 10:
@@ -233,12 +215,12 @@ class LocalLinear(KernelSmooth):
 
 def do_kernel_smoothing(
     raw_image_dir,
+    time,
     voxels,
     sm_image_dir,
     keep_idvs,
     remove_idvs,
     bw_opt,
-    threads,
     temp_path,
     skip_smoothing,
     log,
@@ -254,7 +236,6 @@ def do_kernel_smoothing(
     keep_idvs: pd.MultiIndex of subjects to keep
     remove_idvs: pd.MultiIndex of subjects to remove
     bw_opt (1, ): a scalar of optimal bandwidth
-    threads: number of threads
     temp_path: temporay directory to save a sparse smoothing matrix
     skip_smoothing: if skip kernel smoothing
     log: a logger
@@ -265,10 +246,11 @@ def do_kernel_smoothing(
 
     """
     try:
-        raw_images = ImageManager(raw_image_dir, voxels)
+        raw_images = LongitudinalImageManager(raw_image_dir, voxels)
         raw_images.keep_and_remove(keep_idvs, remove_idvs)
-        n_subjects = len(raw_images.id_idxs)
-        log.info(f"Using {n_subjects} subjects.")
+        raw_images.select_time(time)
+        n_images = len(raw_images.id_idxs)
+        log.info(f"Using {n_images} images.")
 
         ks = LocalLinear(raw_images)
         if skip_smoothing:
@@ -277,17 +259,17 @@ def do_kernel_smoothing(
             log.info("\nDoing kernel smoothing ...")
             bw_list = ks.bw_cand()
             log.info(f"Selecting the optimal bandwidth from\n{np.round(bw_list, 3)}.")
-            sparse_sm_weight = ks.gcv(bw_list, threads, temp_path)
+            sparse_sm_weight = ks.gcv(bw_list, temp_path)
         else:
             bw_opt = np.repeat(bw_opt, raw_images.dim)
             log.info(f"Doing kernel smoothing using the optimal bandwidth.")
-            sparse_sm_weight = ks.smoother(bw_opt, threads)
+            sparse_sm_weight = ks.smoother(bw_opt)
 
         if sparse_sm_weight is not None:
             subject_wise_mean = np.zeros(raw_images.n_voxels, dtype=np.float32)
             with h5py.File(sm_image_dir, "w") as h5f:
                 sm_images = h5f.create_dataset(
-                    "images", shape=(n_subjects, raw_images.n_voxels), dtype="float32"
+                    "images", shape=(n_images, raw_images.n_voxels), dtype="float32"
                 )
                 start_idx, end_idx = 0, 0
                 for images_, _ in raw_images.image_reader():
@@ -296,13 +278,12 @@ def do_kernel_smoothing(
                     sm_image_ = images_ @ sparse_sm_weight.T
                     sm_images[start_idx:end_idx] = sm_image_
                     subject_wise_mean += np.sum(sm_image_, axis=0)
-                subject_wise_mean /= n_subjects
+                subject_wise_mean /= n_images
                 h5f.create_dataset(
-                    "id", data=np.array(raw_images.extracted_ids.tolist(), dtype="S10")
+                    "id", data=np.array(raw_images.ids[raw_images.id_idxs].tolist(), dtype="S10")
                 )
                 h5f.create_dataset("coord", data=raw_images.coord)
-                sm_images.attrs["id"] = "id"
-                sm_images.attrs["coord"] = "coord"
+                h5f.create_dataset("time", data=raw_images.time[raw_images.id_idxs])
         else:
             raise ValueError("the bandwidth provided by --bw-opt may be problematic")
 
@@ -420,11 +401,11 @@ def do_fpca(sm_image_dir, subject_wise_mean, args, log):
 
     """
     try:
-        sm_images = ImageManager(sm_image_dir)
+        sm_images = LongitudinalImageManager(sm_image_dir)
 
         # setup parameters
         log.info("\nDoing PCA ...")
-        fpca = FPCA(sm_images.n_sub, sm_images.n_voxels, args.all_pc, args.n_ldrs)
+        fpca = FPCA(sm_images.n_images, sm_images.n_voxels, args.all_pc, args.n_ldrs)
 
         # incremental PCA
         max_avail_n_sub = fpca.n_batches * fpca.batch_size
@@ -568,12 +549,12 @@ def run(args, log):
         sm_image_dir = f"{args.out}_sm_images.h5"
         subject_wise_mean = do_kernel_smoothing(
             args.image,
+            args.time,
             args.voxels,
             sm_image_dir,
             args.keep,
             args.remove,
             args.bw_opt,
-            args.threads,
             temp_path,
             args.skip_smoothing,
             log,
