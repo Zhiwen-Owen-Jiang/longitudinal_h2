@@ -12,9 +12,11 @@ parser = argparse.ArgumentParser(
 )
 common_parser = parser.add_argument_group(title="Common arguments")
 fpca_parser = parser.add_argument_group(title="Arguments specific to functional PCA")
+spatial_ldr_parser = parser.add_argument_group(title="Arguments specific to constructing spatial LDRs")
 
 # module arguments
 fpca_parser.add_argument("--fpca", action="store_true", help="Functional PCA.")
+spatial_ldr_parser.add_argument("--make-spatial-ldr", action="store_true", help="Constructing spatial LDRs.")
 
 # common arguments
 common_parser.add_argument("--out", help="Prefix of output.")
@@ -72,7 +74,28 @@ common_parser.add_argument(
     help=(
         "number of threads."
     ),
-),
+)
+common_parser.add_argument(
+    "--covar",
+    help=(
+        "Directory to covariate file. "
+        "The file should be tab or space delimited, with each row only one subject."
+    ),
+)
+common_parser.add_argument(
+    "--cat-covar-list",
+    help=(
+        "List of categorical covariates to include in the analysis. "
+        "Multiple covariates are separated by comma."
+    ),
+)
+common_parser.add_argument(
+    "--time-varying-covar-list",
+    help=(
+        "List of time varying covariates to include in the analysis. "
+        "Multiple covariates are separated by comma."
+    ),
+)
 
 # arguments for fpca.py
 fpca_parser.add_argument(
@@ -120,6 +143,19 @@ def check_accepted_args(module, args, log):
             "remove",
             "bw_opt",
             "skip_smoothing",
+        },
+        "make_spatial_ldr": {
+            "out",
+            "make_spatial_ldr",
+            "image",
+            "time",
+            "voxels",
+            "bases",
+            "n_ldrs",
+            "covar",
+            "cat_covar_list",
+            "keep",
+            "remove",
             "threads",
         },
     }

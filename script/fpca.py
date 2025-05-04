@@ -80,7 +80,7 @@ class KernelSmooth:
                     min_score = score[cii]
                     self._save_sparse_sm_weight(sparse_sm_weight, temp_path)
                 self.logger.info(
-                    f"The GCV score for bandwidth {np.round(bw, 3)} is {score[cii]:.3f}."
+                    f"The GCV score for bandwidth {np.round(bw, 3)} is {score[cii]:.3e}."
                 )
             else:
                 score[cii] = np.Inf
@@ -100,7 +100,7 @@ class KernelSmooth:
                 "the optimal bandwidth is invalid. Try to input one using --bw-opt"
             )
         self.logger.info(
-            f"The optimal bandwidth is {np.round(bw_opt, 3)} with GCV score {min_mse:.3f}."
+            f"The optimal bandwidth is {np.round(bw_opt, 3)} with GCV score {min_mse:.3e}."
         )
 
         sparse_sm_weight = self._load_sparse_sm_weight(temp_path)
