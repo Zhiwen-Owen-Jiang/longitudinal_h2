@@ -96,6 +96,12 @@ common_parser.add_argument(
         "Multiple covariates are separated by comma."
     ),
 )
+common_parser.add_argument(
+    "--bases",
+    help=(
+        "Directory to functional bases."
+    ),
+)
 
 # arguments for fpca.py
 fpca_parser.add_argument(
@@ -235,18 +241,22 @@ def main(args, log):
         raise ValueError(f"{os.path.dirname(args.out)} does not exist")
     if (
         args.fpca
+        + args.make_spatial_ldr
         != 1
     ):
         raise ValueError(
             (
                 "must raise one and only one of following module flags: "
-                "--fpca"
+                "--fpca, --make-spatial-ldr"
             )
         )
 
     if args.fpca:
         check_accepted_args("fpca", args, log)
         import script.fpca as module
+    if args.make_spatial_ldr:
+        check_accepted_args("make_spatial_ldr", args, log)
+        import script.spatial_ldr as module
 
     process_args(args, log)
     module.run(args, log)

@@ -144,19 +144,21 @@ def run(args, log):
         if n_voxels != images.n_voxels:
             raise ValueError("the images and bases have different resolution")
 
-        # read covariates
-        log.info(f"Read covariates from {args.covar}")
-        covar = ds.Covar(args.covar, args.cat_covar_list)
+        # # read covariates
+        # log.info(f"Read covariates from {args.covar}")
+        # covar = ds.Covar(args.covar, args.cat_covar_list)
 
         # keep common subjects
-        common_idxs = ds.get_common_idxs(images.ids, covar.data.index, args.keep)
+        # common_idxs = ds.get_common_idxs(images.ids, covar.data.index, args.keep)
+        common_idxs = ds.get_common_idxs(images.ids, args.keep)
         common_idxs = ds.remove_idxs(common_idxs, args.remove)
         images.keep_and_remove(common_idxs)
-        images.select_time(args.time)
-        log.info(f"{len(common_idxs)} common subjects in these files.")
+        if args.time is not None:
+            images.select_time(args.time)
+        log.info(f"{len(common_idxs)} common subjects and {images.n_images} images in these files.")
 
         # contruct ldrs
-        ldrs = np.zeros((len(common_idxs), n_ldrs), dtype=np.float32)
+        ldrs = np.zeros((images.n_images, n_ldrs), dtype=np.float32)
         alt_n_ldrs_list = np.array([
             int(n_ldrs * prop)
             for prop in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1)
@@ -164,7 +166,7 @@ def run(args, log):
 
         log.info(f"Constructing {n_ldrs} LDRs ...")
         rec_corr_images = {
-            alt_n_ldrs: np.zeros(len(common_idxs), np.float32) 
+            alt_n_ldrs: np.zeros(images.n_images, np.float32) 
             for alt_n_ldrs in alt_n_ldrs_list
         }
         start_idx, end_idx = 0, 0
@@ -202,11 +204,11 @@ def run(args, log):
         print_alt_corr(rec_corr_voxels, log)
 
         # process covar
-        covar.keep_and_remove(common_idxs)
-        covar.cat_covar_intercept()
-        log.info(
-            f"{covar.data.shape[1]} fixed effects in the covariates (including the intercept)."
-        )
+        # covar.keep_and_remove(common_idxs)
+        # covar.cat_covar_intercept()
+        # log.info(
+        #     f"{covar.data.shape[1]} fixed effects in the covariates (including the intercept)."
+        # )
 
         # var-cov matrix of projected LDRs
         # ldr_cov = projection_ldr(ldrs, np.array(covar.data))
