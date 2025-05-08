@@ -29,6 +29,9 @@ data structure:
     - image
     - coordinates
 - 
+
+TODO:
+1. select bandwidth?
 """
 
 
@@ -49,7 +52,6 @@ class LocalLinear(ABC):
         self.unique_time = np.sort(np.unique(time))
         self.sub_obs = sub_obs
         self.sub_ids, self.n_obs = np.unique(self.sub_obs, return_counts=True)
-        self.n_sub = len(self.sub_ids)
         self.n_obs_adj = np.repeat(1 / self.n_obs, self.n_obs)
         self.n_time = len(self.unique_time)
         self.n_ldrs = ldrs.shape[1]
@@ -190,12 +192,16 @@ def pace(ldrs, sub_time, mean, cov, resid_var):
     mean (n_time, n_ldrs): a np.array of mean estimate
     cov (n_time, n_time, n_ldrs): a np.array of cov estimate
     resid_var (n_time, n_ldrs): a np.array of resid var estimate
+
+    Returns:
+    ---------
+    time_spatial_ldrs (n_sub, n_ldrs, n_time): spatial temporal LDRs
     
     """
     n_sub = len(sub_time)
     n_ldrs = ldrs.shape[1]
     n_time = mean.shape[0]
-    time_spatial_ldr = np.zeros((n_sub, n_ldrs, n_time), dtype=np.float32)
+    time_spatial_ldrs = np.zeros((n_sub, n_ldrs, n_time), dtype=np.float32)
     eg_values = np.zeros((n_ldrs, n_time), dtype=np.float32)
     eg_vectors = np.zeros((n_ldrs, n_time, n_time), dtype=np.float32)
 
@@ -215,18 +221,53 @@ def pace(ldrs, sub_time, mean, cov, resid_var):
             mu_i = mean[time, i] # (n_time_i, )
             Sigma_i_inv = inv(cov[time, time, i] + np.diag(resid_var[time])) # (n_time_i, n_time_i)
             eg_vector = eg_vectors_[time] # (n_time_i, n_time)
-            time_spatial_ldr[sub_id, i] = np.dot(np.dot(eg_vector, Sigma_i_inv), y_i - mu_i)
+            time_spatial_ldrs[sub_id, i] = np.dot(np.dot(eg_vector, Sigma_i_inv), y_i - mu_i)
             start = end
 
-    time_spatial_ldr = time_spatial_ldr.reshape(n_sub, -1)
+    # time_spatial_ldrs = time_spatial_ldrs.reshape(n_sub, -1)
 
-    return time_spatial_ldr
+    return time_spatial_ldrs
+    
+
+def ldr_cov(time_spatial_ldrs, covar):
+    """
+    Computing S'(I - M)S/n = S'S - S'X(X'X)^{-1}X'S/n,
+    where I is the identity matrix,
+    M = X(X'X)^{-1}X' is the project matrix for X,
+    S is the LDR matrix.
+
+    Parameters:
+    ------------
+    time_spatial_ldrs (n_sub, n_ldrs, n_time): low-dimension representaion of imaging data
+    covar (n_sub, n_covar): covariates, including the intercept
+
+    Returns:
+    ---------
+    ldr_cov: variance-covariance matrix of LDRs
+
+    """
+    n_sub, n_ldrs, n_time = time_spatial_ldrs.shape
+    ldr_cov_matrix = np.zeros((n_time, n_ldrs, n_ldrs), dtype=np.float32)
+    inner_covar = np.dot(covar.T, covar)
+    inner_covar_inv = inv(inner_covar)
+
+    for t in range(n_time):
+        ldrs = time_spatial_ldrs[:, :, t]
+        inner_ldr = np.dot(ldrs.T, ldrs)
+        ldr_covar = np.dot(ldrs.T, covar)
+        part2 = np.dot(np.dot(ldr_covar, inner_covar_inv), ldr_covar.T)
+        ldr_cov = (inner_ldr - part2) / n_sub
+        ldr_cov_matrix[t] = ldr_cov
+
+    return ldr_cov_matrix
     
 
 def check_input(args):
     # required arguments
     if args.ldrs is None:
         raise ValueError("--ldrs is required")
+    if args.covar is None:
+        raise ValueError("--covar is required")
 
 
 def run(args, log):
@@ -237,17 +278,23 @@ def run(args, log):
     ldrs = ds.Dataset(args.ldrs)
     log.info(f"{ldrs.data.shape[1]-1} LDRs and {ldrs.data.shape[0]} subjects.")
     if args.n_ldrs is not None:
-        ldrs.data = ldrs.data.iloc[:, : args.n_ldrs]
-        if ldrs.data.shape[1] > args.n_ldrs:
+        ldrs.data = ldrs.data.iloc[:, :args.n_ldrs+1]
+        if ldrs.data.shape[1]-1 > args.n_ldrs:
             log.info(f"WARNING: --n-ldrs greater than #LDRs, using all LDRs.")
         else:
             log.info(f"Keeping the top {args.n_ldrs} LDRs.")
 
+    # read covariates
+    log.info(f"Read covariates from {args.covar}")
+    covar = ds.Covar(args.covar, args.cat_covar_list)
+
     # keep common subjects
-    common_idxs = ds.get_common_idxs(ldrs.data.index, args.keep)
+    common_idxs = ds.get_common_idxs(ldrs.data.index, covar.data.index, args.keep)
     common_idxs = ds.remove_idxs(common_idxs, args.remove)
     log.info(f"{len(common_idxs)} subjects common in these files.")
     ldrs.keep_and_remove(common_idxs)
+    covar.keep_and_remove(common_idxs)
+    covar.cat_covar_intercept()
 
     # estimation
     ldrs_data = np.array(ldrs.data.iloc[:, 1:])
@@ -267,14 +314,20 @@ def run(args, log):
     # PACE
     ldrs.to_single_index()
     sub_time = ldrs.data.groupby("IID")["time"].apply(list).to_dict()
-    time_spatial_ldr = pace(ldrs, sub_time, mean, cov, resid_var)
+    time_spatial_ldrs = pace(ldrs, sub_time, mean, cov, resid_var)
+
+    # cov matrix of LDRs for each time
+    ldr_cov_matrix = ldr_cov(time_spatial_ldrs, covar.data)
+    n_sub = time_spatial_ldrs.shape[0]
+    time_spatial_ldrs = time_spatial_ldrs.reshape(n_sub, -1)
 
     # save
     unique_ids = list(sub_time.keys())
-    time_spatial_ldr = pd.DataFrame(time_spatial_ldr, index=[unique_ids, unique_ids])
+    time_spatial_ldrs = pd.DataFrame(time_spatial_ldrs, index=[unique_ids, unique_ids])
     n_ldrs = ldrs.data.shape[1]-1
     n_time = np.sort(ldrs.data['time'].unique())
-    time_spatial_ldr.columns = [f"{i}_{j}" for i in range(n_ldrs) for j in range(n_time)]
-    time_spatial_ldr.to_csv(f"{args.out}_spatial_temporal_ldr.txt", sep='\t')
+    time_spatial_ldrs.columns = [f"{i}_{j}" for i in range(n_ldrs) for j in range(n_time)]
+    time_spatial_ldrs.to_csv(f"{args.out}_spatial_temporal_ldr.txt", sep='\t')
+    np.save(f"{args.out}_ldr_cov.npy", ldr_cov_matrix)
 
     log.info(f"Saved spatial temporal LDRs to {args.out}_spatial_temporal_ldr.txt")

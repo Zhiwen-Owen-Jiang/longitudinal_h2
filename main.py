@@ -13,10 +13,12 @@ parser = argparse.ArgumentParser(
 common_parser = parser.add_argument_group(title="Common arguments")
 fpca_parser = parser.add_argument_group(title="Arguments specific to functional PCA")
 spatial_ldr_parser = parser.add_argument_group(title="Arguments specific to constructing spatial LDRs")
+pace_parser = parser.add_argument_group(title="Arguments specific to estimating functional PCs using PACE")
 
 # module arguments
 fpca_parser.add_argument("--fpca", action="store_true", help="Functional PCA.")
 spatial_ldr_parser.add_argument("--make-spatial-ldr", action="store_true", help="Constructing spatial LDRs.")
+pace_parser.add_argument("--pace", action="store_true", help="Estimating functional PCs using PACE.")
 
 # common arguments
 common_parser.add_argument("--out", help="Prefix of output.")
@@ -164,6 +166,16 @@ def check_accepted_args(module, args, log):
             "remove",
             "threads",
         },
+        "pace": {
+            "out",
+            "pace",
+            "ldrs",
+            "n_ldrs",
+            "covar",
+            "cat_covar_list",
+            "keep",
+            "remove",
+        },
     }
 
     ignored_args = []
@@ -242,12 +254,13 @@ def main(args, log):
     if (
         args.fpca
         + args.make_spatial_ldr
+        + args.pace
         != 1
     ):
         raise ValueError(
             (
                 "must raise one and only one of following module flags: "
-                "--fpca, --make-spatial-ldr"
+                "--fpca, --make-spatial-ldr, --pace"
             )
         )
 
@@ -257,6 +270,9 @@ def main(args, log):
     if args.make_spatial_ldr:
         check_accepted_args("make_spatial_ldr", args, log)
         import script.spatial_ldr as module
+    if args.pace:
+        check_accepted_args("pace", args, log)
+        import script.pace as module
 
     process_args(args, log)
     module.run(args, log)
