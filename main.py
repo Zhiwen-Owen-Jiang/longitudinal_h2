@@ -80,7 +80,7 @@ common_parser.add_argument(
 common_parser.add_argument(
     "--covar",
     help=(
-        "Directory to covariate file. "
+        "Directory to baseline covariate file. "
         "The file should be tab or space delimited, with each row only one subject."
     ),
 )
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.out is None:
-        args.out = "heig"
+        args.out = "main"
 
     logpath = os.path.join(f"{args.out}.log")
     log = GetLogger(logpath)
