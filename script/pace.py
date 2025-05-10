@@ -204,7 +204,6 @@ def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
         eg_vectors[i] = eg_vectors_
         eg_vectors_ = eg_vectors_ * eg_values_
         
-        # TODO: map time to index
         start, end = 0, 0
         for sub_idx, (_, time) in enumerate(sub_time.items()):
             end += len(time)
