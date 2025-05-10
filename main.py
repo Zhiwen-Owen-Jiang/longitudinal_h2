@@ -104,6 +104,12 @@ common_parser.add_argument(
         "Directory to functional bases."
     ),
 )
+common_parser.add_argument(
+    "--spatial-ldrs",
+    help=(
+        "Directory to spatial LDRs."
+    ),
+)
 
 # arguments for fpca.py
 fpca_parser.add_argument(
@@ -169,7 +175,7 @@ def check_accepted_args(module, args, log):
         "pace": {
             "out",
             "pace",
-            "ldrs",
+            "spatial_ldrs",
             "n_ldrs",
             "covar",
             "cat_covar_list",

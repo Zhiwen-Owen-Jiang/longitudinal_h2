@@ -39,8 +39,8 @@ class Dataset:
         )
 
         n_sub = len(self.data)
-        self.data.drop_duplicates(subset=["FID", "IID"], inplace=True, keep=False)
-        self.logger.info(f"Removed {n_sub - len(self.data)} duplicated subjects.")
+        # self.data.drop_duplicates(subset=["FID", "IID"], inplace=True, keep=False)
+        # self.logger.info(f"Removed {n_sub - len(self.data)} duplicated subjects.")
         self._remove_na_inf()
 
         self.data = self.data.set_index(["FID", "IID"])
@@ -195,7 +195,7 @@ class Covar(Dataset):
             == qcovar_df.select_dtypes(include=np.number).shape[1]
         ):
             raise ValueError("did you forget some categorical variables?")
-        covar_df = pd.get_dummies(covar_df, drop_first=True).astype(int)
+        covar_df = pd.get_dummies(covar_df, drop_first=True, columns=catlist).astype(int)
         data = pd.concat([covar_df, qcovar_df], axis=1)
 
         return data

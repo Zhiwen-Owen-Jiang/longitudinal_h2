@@ -20,17 +20,18 @@ class LocalLinear(ABC):
     def __init__(self, ldrs, time, n_obs,):
         """
         ldrs (n_obs, n_ldrs): a np.array of ldrs in long format 
-        time (n_obs,): a np.array of time points (normalized)
+        time (n_obs,): a np.array of time points
         n_obs (n_sub,): a np.array of numbers of obs for each subject
         
         """
         self.ldrs = ldrs
         self.time = time
-        self.unique_time = np.unique(time)
         self.n_obs = n_obs
+        self.time = self.time / np.max(self.time)
+        self.unique_time = np.unique(self.time)
         self.n_obs_adj = np.repeat(1 / self.n_obs, self.n_obs)
         self.n_time = len(self.unique_time)
-        self.n_ldrs = ldrs.shape[1]
+        self.n_ldrs = self.ldrs.shape[1]
 
     def _gau_kernel(self, x):
         """
@@ -38,6 +39,8 @@ class LocalLinear(ABC):
 
         """
         gau_k = 1 / np.sqrt(2 * np.pi) * np.exp(-0.5 * x**2)
+        if len(gau_k.shape) == 2:
+            gau_k = np.prod(gau_k, axis=1).reshape(-1, 1)
         return gau_k.astype(np.float32)
     
     @staticmethod
@@ -46,6 +49,8 @@ class LocalLinear(ABC):
         Weighted least squares
         
         """
+        if len(weights.shape) == 1:
+            weights = weights.reshape(-1, 1)
         xw = x * weights
         xtx = np.dot(xw.T, x)
         xty = np.dot(xw.T, y)
@@ -68,16 +73,17 @@ class LocalLinear(ABC):
 
 class Mean(LocalLinear):
     def _get_design_matrix(self, t, bw):
-        time_diff = (self.time - t).reshape(-1, 1)
+        time_diff = self.time - t
         weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        time_diff = time_diff.reshape(-1, 1)
         x = np.hstack([np.ones_like(time_diff), time_diff])
         return x, weights
     
     def estimate(self, bw):
         mean_function = np.zeros((self.n_time, self.n_ldrs), dtype=np.float32)
-        for t in self.unique_time:
+        for i, t in enumerate(self.unique_time):
             x, weights = self._get_design_matrix(t, bw)
-            mean_function[t] = self._wls(x, self.ldrs, weights)
+            mean_function[i] = self._wls(x, self.ldrs, weights)
         mean_function = mean_function.T
         return mean_function    
     
@@ -85,9 +91,9 @@ class Mean(LocalLinear):
 class Covariance(LocalLinear):
     def __init__(self, ldrs, time, sub_obs):
         super().__init__(ldrs, time, sub_obs)
-        if (self.n_obs == 1).any():
-            raise ValueError('number of observations must be greater than 1')
-        self.n_obs_adj1 = np.repeat(1 / (self.n_obs - 1), self.n_obs)
+        self.n_obs_adj = np.repeat(
+            1 / (self.n_obs * (self.n_obs - 1)), self.n_obs * (self.n_obs - 1)
+        ).reshape(-1, 1)
         
         self.two_way_ldrs = np.zeros(
             (np.sum(self.n_obs ** 2 - self.n_obs), self.n_ldrs), 
@@ -106,7 +112,7 @@ class Covariance(LocalLinear):
             off_diag = ~np.eye(n_obs, dtype=bool)
 
             # time
-            time_stack_by_col = np.tile(self.time[start1: end1], n_obs)
+            time_stack_by_col = np.tile(self.time[start1: end1].reshape(-1, 1), n_obs)
             time_stack_by_row = time_stack_by_col.T
             self.two_way_time[start2: end2, 0] = time_stack_by_row[off_diag]
             self.two_way_time[start2: end2, 1] = time_stack_by_col[off_diag]
@@ -122,7 +128,7 @@ class Covariance(LocalLinear):
 
     def _get_design_matrix(self, t1, t2, bw):
         time_diff = self.two_way_time - np.array([t1, t2])
-        weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj * self.n_obs_adj1
+        weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
         x = np.hstack([np.ones(time_diff.shape[0], dtype=np.float32).reshape(-1, 1), time_diff])
         return x, weights
     
@@ -130,38 +136,42 @@ class Covariance(LocalLinear):
         cov_function = np.zeros((self.n_ldrs, self.n_time, self.n_time), dtype=np.float32)
         for t1 in range(self.n_time):
             for t2 in range(t1, self.n_time):
-                x, weights = self._get_design_matrix(t1, t2, bw)
-                cov_function[:, t1, t2] = self._wls(x, self.two_way_ldrs, weights)
+                x, weights = self._get_design_matrix(self.unique_time[t1], self.unique_time[t2], bw)
+                cov_function[:, t1, t2] = (
+                    self._wls(x, self.two_way_ldrs, weights) - mean[:, t1] * mean[:, t2]
+                )
         
         iu_rows, iu_cols = np.triu_indices(self.n_time, k=1)
         for i in range(self.n_ldrs):
             cov_function[i][(iu_cols, iu_rows)] = cov_function[i][(iu_rows, iu_cols)]
-            cov_function[i] = cov_function[i] - np.dot(mean[i], mean[i].T)
+            # cov_function[i] = cov_function[i] - np.dot(mean[i].reshape(-1, 1).T, mean[i])
 
         return cov_function
     
 
 class ResidualVariance(LocalLinear):
     def _get_design_matrix(self, t, bw):
-        time_diff = (self.time - t).reshape(-1, 1)
+        time_diff = self.time - t
         weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        time_diff = time_diff.reshape(-1, 1)
         x = np.hstack([np.ones_like(time_diff), time_diff])
         return x, weights
     
-    def estimate(self, cov, bw):
+    def estimate(self, mean, cov, bw):
         resid_var = np.zeros((self.n_time, self.n_ldrs), dtype=np.float32)
-        for t in self.unique_time:
+        for i, t in enumerate(self.unique_time):
             x, weights = self._get_design_matrix(t, bw)
-            resid_var[t] = self._wls(x, self.ldrs**2, weights)
+            resid_var[i] = self._wls(x, self.ldrs**2, weights) - mean[:, i]**2
         resid_var = resid_var.T
 
         for i in range(self.n_ldrs):
             resid_var[i] = resid_var[i] - np.diag(cov[i])
+            # TODO: negative var?
 
         return resid_var
     
 
-def pace(ldrs, sub_time, mean, cov, resid_var):
+def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
     """
     PACE estimator for time LDRs
 
@@ -169,6 +179,7 @@ def pace(ldrs, sub_time, mean, cov, resid_var):
     ------------
     ldrs (n_obs, n_ldrs): a np.array of ldrs in long format 
     sub_time: a dictionary of sub:time, where sub should start with 0
+    unique_time_map: a dictionary of mapping time to index
     mean (n_ldrs, n_time): a np.array of mean estimate
     cov (n_ldrs, n_time, n_time): a np.array of cov estimate
     resid_var (n_ldrs, n_time): a np.array of resid var estimate
@@ -179,8 +190,7 @@ def pace(ldrs, sub_time, mean, cov, resid_var):
     
     """
     n_sub = len(sub_time)
-    n_ldrs = ldrs.shape[1]
-    n_time = mean.shape[0]
+    n_ldrs, n_time = mean.shape
     time_spatial_ldrs = np.zeros((n_ldrs, n_sub, n_time), dtype=np.float32)
     recon_spatial_ldrs = np.zeros((n_ldrs, n_sub, n_time), dtype=np.float32)
     eg_values = np.zeros((n_ldrs, n_time), dtype=np.float32)
@@ -194,14 +204,16 @@ def pace(ldrs, sub_time, mean, cov, resid_var):
         eg_vectors[i] = eg_vectors_
         eg_vectors_ = eg_vectors_ * eg_values_
         
+        # TODO: map time to index
         start, end = 0, 0
         for sub_idx, (_, time) in enumerate(sub_time.items()):
             end += len(time)
+            time_idx = np.array([unique_time_map.get(t, 0) for t in time])
             y_i = ldrs[start: end, i] # (n_time_i, )
-            mu_i = mean[i, time] # (n_time_i, )
-            Sigma_i_inv = inv(cov[i, time, time] + np.diag(resid_var[i, time])) # (n_time_i, n_time_i)
-            eg_vector = eg_vectors_[time] # (n_time_i, n_time)
-            time_spatial_ldrs[i, sub_idx] = np.dot(np.dot(eg_vector, Sigma_i_inv), y_i - mu_i)
+            # mu_i = mean[i, time_idx] # (n_time_i, )
+            Sigma_i_inv = np.linalg.inv(cov[i, time_idx, time_idx] + np.diag(resid_var[i, time_idx])) # (n_time_i, n_time_i)
+            eg_vector = eg_vectors_[time_idx] # (n_time_i, n_time)
+            time_spatial_ldrs[i, sub_idx] = np.dot(np.dot(eg_vector.T, Sigma_i_inv), y_i)
             start = end
         
         # do reconstruction for time
@@ -246,7 +258,7 @@ def ldr_cov(recon_spatial_ldrs, covar):
 
 def check_input(args):
     # required arguments
-    if args.ldrs is None:
+    if args.spatial_ldrs is None:
         raise ValueError("--ldrs is required")
     if args.covar is None:
         raise ValueError("--covar is required")
@@ -256,9 +268,9 @@ def run(args, log):
     check_input(args)
 
     # read ldrs
-    log.info(f"Read LDRs from {args.ldrs}")
-    ldrs = ds.Dataset(args.ldrs)
-    log.info(f"{ldrs.data.shape[1]-1} LDRs and {ldrs.data.shape[0]} subjects.")
+    log.info(f"Read LDRs from {args.spatial_ldrs}")
+    ldrs = ds.Dataset(args.spatial_ldrs)
+    log.info(f"{ldrs.data.shape[1]-1} LDRs and {ldrs.data.shape[0]} observations.")
     if args.n_ldrs is not None:
         ldrs.data = ldrs.data.iloc[:, :args.n_ldrs+1]
         if ldrs.data.shape[1]-1 > args.n_ldrs:
@@ -266,41 +278,50 @@ def run(args, log):
         else:
             log.info(f"Keeping the top {args.n_ldrs} LDRs.")
 
+    # remove subjects with a single obs
+    n_obs = ldrs.data.index.value_counts(sort=False).values
+    obs_to_exclude = np.cumsum(n_obs)[n_obs == 1] - 1
+    ids_to_exclude = ldrs.data.index[obs_to_exclude]
+    log.info(f"Removed {len(obs_to_exclude)} subjects with only one observation.")
+
     # read covariates
     log.info(f"Read covariates from {args.covar}")
     covar = ds.Covar(args.covar, args.cat_covar_list)
 
     # keep common subjects
     common_idxs = ds.get_common_idxs(ldrs.data.index, covar.data.index, args.keep)
-    common_idxs = ds.remove_idxs(common_idxs, args.remove)
+    if args.remove is not None:
+        ids_to_exclude = ids_to_exclude.union(args.remove)
+    common_idxs = ds.remove_idxs(common_idxs, ids_to_exclude)
     log.info(f"{len(common_idxs)} subjects common in these files.")
     ldrs.keep_and_remove(common_idxs)
     covar.keep_and_remove(common_idxs)
     covar.cat_covar_intercept()
 
     # estimation
+    log.info("Reconstruct time by PACE ...")
     ldrs_data = np.array(ldrs.data.iloc[:, 1:])
-    time = ldrs_data['time'].values
-    normed_time = time / np.max(time)
-    ids = ldrs.index
+    time = ldrs.data['time'].values
+    ids = ldrs.data.index
     ldrs.to_single_index()
     n_obs = ldrs.data.index.value_counts(sort=False).values
-    
-    mean_estimator = Mean(ldrs, normed_time, n_obs)
+
+    mean_estimator = Mean(ldrs_data, time, n_obs)
     mean = mean_estimator.estimate(0.1)
     
-    cov_estimator = Covariance(ldrs, normed_time, n_obs)
+    cov_estimator = Covariance(ldrs_data, time, n_obs)
     cov = cov_estimator.estimate(mean, 0.1)
 
-    resid_var_estimator = ResidualVariance(ldrs, normed_time, n_obs)
-    resid_var = resid_var_estimator(cov, 0.1)
+    resid_var_estimator = ResidualVariance(ldrs_data, time, n_obs)
+    resid_var = resid_var_estimator.estimate(mean, cov, 0.1)
 
     # PACE
     sub_time = ldrs.data.groupby("IID")["time"].apply(list).to_dict()
-    recon_spatial_ldrs = pace(ldrs, sub_time, mean, cov, resid_var)
+    unique_time_map = {t: i for i, t in enumerate(np.unique(ldrs.data["time"]))}
+    recon_spatial_ldrs = pace(ldrs_data, sub_time, unique_time_map, mean, cov, resid_var)
 
     # cov matrix of LDRs for each time
-    ldr_cov_matrix = ldr_cov(recon_spatial_ldrs, covar.data)
+    ldr_cov_matrix = ldr_cov(recon_spatial_ldrs, np.array(covar.data))
 
     # save
     with h5py.File(f"{args.out}_recon_ldr.h5", 'w') as file:
