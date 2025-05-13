@@ -2,8 +2,10 @@ import os
 import logging
 import hail as hl
 import script.dataset as ds
+from tqdm import tqdm
 from script.relatedness import LOCOpreds
 from script.hail_utils import read_genotype_data, init_hail, get_temp_path, clean
+from script.pace import ReconLDRs
 
 
 """
@@ -76,8 +78,8 @@ def pandas_to_table(df, dir):
 
 def check_input(args, log):
     # required arguments
-    if args.ldrs is None:
-        raise ValueError("--ldrs is required")
+    if args.recon_ldrs is None:
+        raise ValueError("--recon-ldrs is required")
     if args.covar is None:
         raise ValueError("--covar is required")
     if args.spark_conf is None:
@@ -269,21 +271,18 @@ def run(args, log):
         init_hail(args.spark_conf, args.grch37, args.out, log)
 
         # read LDRs and covariates
-        log.info(f"Read LDRs from {args.ldrs}")
-        ldrs = ds.Dataset(args.ldrs)
-        log.info(f"{ldrs.data.shape[1]} LDRs and {ldrs.data.shape[0]} subjects.")
-        if args.ldr_col is not None:
-            if ldrs.data.shape[1] < args.ldr_col[1]:
-                raise ValueError(f"--ldr-col or --n-ldrs out of index")
-            else:
-                log.info(f"Keeping LDR{args.ldr_col[0]+1} to LDR{args.ldr_col[1]}.")
-            ldrs.data = ldrs.data.iloc[:, args.ldr_col[0] : args.ldr_col[1]]
+        log.info(f"Read reconstructed LDRs from {args.recon_ldrs}")
+        ldrs = ReconLDRs(args.recon_ldrs)
+
+        log.info(f"{ldrs.n_time} time point(s), {ldrs.n_sub} subjects, and {ldrs.n_ldrs} LDR(s).")
+        ldrs.select_ldrs(args.ldr_col)
 
         log.info(f"Read covariates from {args.covar}")
         covar = ds.Covar(args.covar, args.cat_covar_list)
 
         # read loco preds
         if args.loco_preds is not None:
+            raise RuntimeError("--loco-preds is not supported yet")
             log.info(f"Read LOCO predictions from {args.loco_preds}")
             loco_preds = LOCOpreds(args.loco_preds)
             loco_preds.select_ldrs(args.ldr_col)
@@ -303,7 +302,7 @@ def run(args, log):
         else:
             # keep subjects
             common_ids = ds.get_common_idxs(
-                ldrs.data.index, covar.data.index, args.keep
+                ldrs.ids, covar.data.index, args.keep
             )
         common_ids = ds.remove_idxs(common_ids, args.remove, single_id=True)
 
@@ -318,13 +317,13 @@ def run(args, log):
 
         # extract common subjects and align data
         snps_mt_ids = gprocessor.subject_id()
-        ldrs.to_single_index()
         covar.to_single_index()
-        ldrs.keep_and_remove(snps_mt_ids)
+        ldrs.keep(snps_mt_ids)
         covar.keep_and_remove(snps_mt_ids)
         covar.cat_covar_intercept()
 
         if args.loco_preds is not None:
+            raise RuntimeError("--loco-preds is not supported yet")
             loco_preds.keep(snps_mt_ids)
         else:
             loco_preds = None
@@ -336,11 +335,11 @@ def run(args, log):
         # gwas
         temp_path = get_temp_path(args.out)
         gprocessor.cache()
-        gwas = DoGWAS(gprocessor, ldrs.data, covar.data, temp_path, loco_preds)
-
-        # save gwas results
-        gwas.save(args.out)
-        log.info(f"\nSaved GWAS results to {args.out}.parquet")
+        
+        for t, time_ldrs in tqdm(enumerate(ldrs.data_reader()), desc=f"{ldrs.n_time} time points"):
+            gwas = DoGWAS(gprocessor, time_ldrs, covar.data, temp_path, loco_preds)
+            gwas.save(f"{args.out}_time{t}")
+            log.info(f"\nSaved GWAS results of time point {t} to {args.out}_time{t}.parquet")
     finally:
         if "temp_path" in locals():
             if os.path.exists(f"{temp_path}_covar.txt"):
@@ -351,5 +350,7 @@ def run(args, log):
                 log.info(f"Removed temporary LDR data at {temp_path}_ldr.txt")
         if "loco_preds" in locals() and args.loco_preds is not None:
             loco_preds.close()
+        if "ldrs" in locals():
+            ldrs.close()
 
         clean(args.out)
