@@ -1,5 +1,7 @@
 import h5py
+import logging
 import numpy as np
+import pandas as pd
 from abc import ABC, abstractmethod
 from scipy.linalg import cho_solve, cho_factor
 from script.utils import inv
@@ -253,12 +255,87 @@ def ldr_cov(recon_spatial_ldrs, covar):
         ldr_cov_matrix[t] = ldr_cov
 
     return ldr_cov_matrix
+
+
+class ReconLDRs:
+    """
+    Reading and managing reconstructed spatial LDRs
     
+    """
+    def __init__(self, file_path):
+        self.file = h5py.File(file_path, "r")
+        self.ldrs = self.file["ldrs"]
+        self.n_time, self.n_sub, self.n_ldrs = self.ldrs.shape
+        self.time = self.file["time"][:]
+        ids = self.file["id"][:]
+        self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
+        self.id_idxs = np.arange(len(self.ids))
+        # self.time_idxs = np.arange(len(self.time))
+        self.ldr_col = (0, self.n_ldrs)
+        self.logger = logging.getLogger(__name__)
+        
+    def close(self):
+        self.file.close()
+        
+    def select_ldrs(self, ldr_col=None):
+        """
+        ldr_col: [start, end) of zero-based LDR index
+
+        """
+        if ldr_col is not None:
+            if ldr_col[1] <= self.n_ldrs:
+                self.ldr_col = ldr_col
+                self.logger.info(
+                    f"Keeping LDR{ldr_col[0]+1} to LDR{ldr_col[1]}."
+                )
+            else:
+                raise ValueError(
+                    f"{ldr_col[1]} is greater than #LDRs"
+                )
+
+    def keep(self, keep_idvs):
+        """
+        Keep subjects
+        this method will only be invoked after extracting common subjects
+
+        Parameters:
+        ------------
+        keep_idvs: a list or pd.MultiIndex of subject ids
+
+        Returns:
+        ---------
+        self.id_idxs: numeric indices of subjects
+
+        """
+        if isinstance(keep_idvs, list):
+            keep_idvs = pd.MultiIndex.from_arrays(
+                [keep_idvs, keep_idvs], names=["FID", "IID"]
+            )
+        common_ids = ds.get_common_idxs(keep_idvs, self.ids).get_level_values("IID")
+        ids_df = pd.DataFrame(
+            {"id": self.id_idxs}, index=self.ids.get_level_values("IID")
+        )
+        ids_df = ids_df.loc[common_ids]
+        self.id_idxs = ids_df["id"].values
+        if len(self.id_idxs) == 0:
+            raise ValueError("no subject remaining in LOCO predictions")
+
+    def data_reader(self):
+        """
+        Reading LDRs for a time point
+
+        """
+        for t in range(self.n_time):
+            spatial_ldrs = self.ldrs[t][self.id_idxs, self.ldr_col[0]:self.ldr_col[1]]
+            spatial_ldrs_df = pd.DataFrame(spatial_ldrs, index=self.ids[self.id_idxs])
+            spatial_ldrs_df = spatial_ldrs_df.reset_index(level=0, drop=True)
+            yield spatial_ldrs_df
+
 
 def check_input(args):
     # required arguments
     if args.spatial_ldrs is None:
-        raise ValueError("--ldrs is required")
+        raise ValueError("--spatial-ldrs is required")
     if args.covar is None:
         raise ValueError("--covar is required")
 
@@ -301,6 +378,7 @@ def run(args, log):
     log.info("Reconstruct time by PACE ...")
     ldrs_data = np.array(ldrs.data.iloc[:, 1:])
     time = ldrs.data['time'].values
+    unique_time = np.unique(time)
     ids = ldrs.data.index
     ldrs.to_single_index()
     n_obs = ldrs.data.index.value_counts(sort=False).values
@@ -316,21 +394,22 @@ def run(args, log):
 
     # PACE
     sub_time = ldrs.data.groupby("IID")["time"].apply(list).to_dict()
-    unique_time_map = {t: i for i, t in enumerate(np.unique(ldrs.data["time"]))}
+    unique_time_map = {t: i for i, t in enumerate(unique_time)}
     recon_spatial_ldrs = pace(ldrs_data, sub_time, unique_time_map, mean, cov, resid_var)
 
     # cov matrix of LDRs for each time
     ldr_cov_matrix = ldr_cov(recon_spatial_ldrs, np.array(covar.data))
 
     # save
-    with h5py.File(f"{args.out}_recon_ldr.h5", 'w') as file:
+    utf8_dt = h5py.string_dtype(encoding='utf-8')
+    with h5py.File(f"{args.out}_recon_ldrs.h5", 'w') as file:
         file.create_dataset("ldrs", data=recon_spatial_ldrs, dtype="float32")
-        file.create_dataset("id", data=np.array(ids.tolist(), dtype="S10"))
-        file.create_dataset("time", data=np.unique(time))
+        file.create_dataset("id", data=np.array(ids.tolist()), dtype=utf8_dt)
+        file.create_dataset("time", data=unique_time)
 
     np.save(f"{args.out}_ldr_cov.npy", ldr_cov_matrix)
 
-    log.info(f"\nSaved spatial temporal LDRs to {args.out}_recon_ldr.h5")
+    log.info(f"\nSaved spatial temporal LDRs to {args.out}_recon_ldrs.h5")
     log.info(
         (
             f"Saved the variance-covariance matrix of covariate-effect-removed LDRs "
