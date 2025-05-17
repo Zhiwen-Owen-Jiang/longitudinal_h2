@@ -34,6 +34,8 @@ class LocalLinear(ABC):
         self.n_obs_adj = np.repeat(1 / self.n_obs, self.n_obs)
         self.n_time = len(self.unique_time)
         self.n_ldrs = self.ldrs.shape[1]
+        grid_size = (self.unique_time[-1] - self.unique_time[0]) / 50
+        self.time_grid = np.arange(self.unique_time[0], self.unique_time[-1] + grid_size, grid_size)
 
     def _gau_kernel(self, x):
         """
@@ -76,22 +78,31 @@ class LocalLinear(ABC):
 class Mean(LocalLinear):
     def _get_design_matrix(self, t, bw):
         time_diff = self.time - t
-        weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        # weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        weights = self._gau_kernel(time_diff / bw)
         time_diff = time_diff.reshape(-1, 1)
         x = np.hstack([np.ones_like(time_diff), time_diff])
         return x, weights
     
     def estimate(self, bw):
         mean_function = np.zeros((self.n_time, self.n_ldrs), dtype=np.float32)
+        grid_mean_function = np.zeros((51, self.n_ldrs), dtype=np.float32)
+        
         for i, t in enumerate(self.unique_time):
             x, weights = self._get_design_matrix(t, bw)
             mean_function[i] = self._wls(x, self.ldrs, weights)
         mean_function = mean_function.T
-        return mean_function    
+
+        for i, t in enumerate(self.time_grid):
+            x, weights = self._get_design_matrix(t, bw)
+            grid_mean_function[i] = self._wls(x, self.ldrs, weights)
+        grid_mean_function = grid_mean_function.T
+
+        return mean_function, grid_mean_function   
     
 
 class Covariance(LocalLinear):
-    def __init__(self, ldrs, time, sub_obs):
+    def __init__(self, ldrs, time, sub_obs, mean, time_idx):
         super().__init__(ldrs, time, sub_obs)
         self.n_obs_adj = np.repeat(
             1 / (self.n_obs * (self.n_obs - 1)), self.n_obs * (self.n_obs - 1)
@@ -121,56 +132,91 @@ class Covariance(LocalLinear):
 
             for i in range(self.n_ldrs):
                 # ldr
-                sub_ldr = self.ldrs[start1: end1, i].reshape(-1, 1)
+                sub_ldr = ldrs[start1: end1, i]
+                sub_ldr = sub_ldr - mean[i, time_idx[start1: end1]]
+                sub_ldr = sub_ldr.reshape(-1, 1)
                 outer_prod_sub_ldr = np.dot(sub_ldr, sub_ldr.T)
                 self.two_way_ldrs[start2: end2, i] = outer_prod_sub_ldr[off_diag]
 
             start1 = end1
             start2 = end2
 
+        self.unique_time_comb = np.zeros((self.n_time ** 2 - self.n_time, 2), dtype=np.float32)
+        self.mean_ldrs = np.zeros((self.n_time ** 2 - self.n_time, self.n_ldrs), dtype=np.float32)
+        self.time_comb_count = np.zeros((self.n_time ** 2 - self.n_time, 1), dtype=np.int32)
+        k = 0
+        for i in range(self.n_time):
+            for j in range(self.n_time):
+                if i != j:
+                    t1 = self.unique_time[i]
+                    t2 = self.unique_time[j]
+                    self.unique_time_comb[k] = np.array([t1, t2])
+                    time_comb_idx = (self.two_way_time == self.unique_time_comb[k]).all(axis=1)
+                    self.time_comb_count[k] = np.sum(time_comb_idx)
+                    self.mean_ldrs[k] = np.mean(self.two_way_ldrs[time_comb_idx], axis=0)
+                    k += 1
+
     def _get_design_matrix(self, t1, t2, bw):
-        time_diff = self.two_way_time - np.array([t1, t2])
-        weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        """
+        TODO: set large distances as 0.
+        
+        """
+        time_diff = self.unique_time_comb - np.array([t1, t2])
+        # weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        weights = self._gau_kernel(time_diff / bw) * self.time_comb_count
         x = np.hstack([np.ones(time_diff.shape[0], dtype=np.float32).reshape(-1, 1), time_diff])
         return x, weights
     
-    def estimate(self, mean, bw):
+    def estimate(self, bw):
         cov_function = np.zeros((self.n_ldrs, self.n_time, self.n_time), dtype=np.float32)
+        grid_cov_function = np.zeros((self.n_ldrs, 51, 51), dtype=np.float32)
+
         for t1 in range(self.n_time):
             for t2 in range(t1, self.n_time):
                 x, weights = self._get_design_matrix(self.unique_time[t1], self.unique_time[t2], bw)
-                cov_function[:, t1, t2] = (
-                    self._wls(x, self.two_way_ldrs, weights) - mean[:, t1] * mean[:, t2]
-                )
+                cov_function[:, t1, t2] = self._wls(x, self.mean_ldrs, weights)
         
         iu_rows, iu_cols = np.triu_indices(self.n_time, k=1)
         for i in range(self.n_ldrs):
             cov_function[i][(iu_cols, iu_rows)] = cov_function[i][(iu_rows, iu_cols)]
-            # cov_function[i] = cov_function[i] - np.dot(mean[i].reshape(-1, 1).T, mean[i])
 
-        return cov_function
+        for t1 in range(51):
+            for t2 in range(t1, 51):
+                x, weights = self._get_design_matrix(self.time_grid[t1], self.time_grid[t2], bw)
+                grid_cov_function[:, t1, t2] = self._wls(x, self.mean_ldrs, weights)
+        
+        iu_rows, iu_cols = np.triu_indices(51, k=1)
+        for i in range(self.n_ldrs):
+            grid_cov_function[i][(iu_cols, iu_rows)] = grid_cov_function[i][(iu_rows, iu_cols)]
+
+        return cov_function, grid_cov_function
     
 
 class ResidualVariance(LocalLinear):
     def _get_design_matrix(self, t, bw):
         time_diff = self.time - t
-        weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        # weights = self._gau_kernel(time_diff / bw) / bw * self.n_obs_adj
+        weights = self._gau_kernel(time_diff / bw)
         time_diff = time_diff.reshape(-1, 1)
         x = np.hstack([np.ones_like(time_diff), time_diff])
         return x, weights
     
-    def estimate(self, mean, cov, bw):
+    def estimate(self, mean, time_idx, bw):
+        one_way_mean = mean[0, time_idx].reshape(-1, 1)
         resid_var = np.zeros((self.n_time, self.n_ldrs), dtype=np.float32)
+        grid_resid_var = np.zeros((51, self.n_ldrs), dtype=np.float32)
+
         for i, t in enumerate(self.unique_time):
             x, weights = self._get_design_matrix(t, bw)
-            resid_var[i] = self._wls(x, self.ldrs**2, weights) - mean[:, i]**2
+            resid_var[i] = self._wls(x, (self.ldrs - one_way_mean)**2, weights)
         resid_var = resid_var.T
 
-        for i in range(self.n_ldrs):
-            resid_var[i] = resid_var[i] - np.diag(cov[i])
-            # TODO: negative var?
+        for i, t in enumerate(self.time_grid):
+            x, weights = self._get_design_matrix(t, bw)
+            grid_resid_var[i] = self._wls(x, (self.ldrs - one_way_mean)**2, weights)
+        grid_resid_var = grid_resid_var.T
 
-        return resid_var
+        return resid_var, grid_resid_var
     
 
 def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
@@ -379,18 +425,20 @@ def run(args, log):
     ldrs_data = np.array(ldrs.data.iloc[:, 1:])
     time = ldrs.data['time'].values
     unique_time = np.unique(time)
+    unique_time_idx = {x: i for i, x in enumerate(unique_time)}
+    time_idx = np.array([unique_time_idx[x] for x in time])
     ids = ldrs.data.index
     ldrs.to_single_index()
     n_obs = ldrs.data.index.value_counts(sort=False).values
 
     mean_estimator = Mean(ldrs_data, time, n_obs)
-    mean = mean_estimator.estimate(0.1)
+    mean, grid_mean = mean_estimator.estimate(0.1)
     
-    cov_estimator = Covariance(ldrs_data, time, n_obs)
-    cov = cov_estimator.estimate(mean, 0.1)
+    cov_estimator = Covariance(ldrs_data, time, n_obs, mean, time_idx)
+    cov, grid_cov = cov_estimator.estimate(0.1)
 
     resid_var_estimator = ResidualVariance(ldrs_data, time, n_obs)
-    resid_var = resid_var_estimator.estimate(mean, cov, 0.1)
+    resid_var, grid_resid_var = resid_var_estimator.estimate(mean, time_idx, 0.1)
 
     # PACE
     sub_time = ldrs.data.groupby("IID")["time"].apply(list).to_dict()
