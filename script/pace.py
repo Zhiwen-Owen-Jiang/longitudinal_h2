@@ -14,6 +14,17 @@ TODO:
 """
 
 
+def traz(f, g):
+    if len(f) != len(g):
+        raise ValueError('f and g have different lengths')
+    if not all(f[i] < f[i+1] for i in range(len(f)-1)):
+        raise ValueError('f must be strictly increasing')
+    res = 0
+    for i in range(len(f) - 1):
+        res += 0.5 * (f[i+1] - f[i]) * (g[i] + g[i+1])
+    return res
+
+
 class LocalLinear(ABC):
     """
     Abstract class for local linear estimator.
@@ -167,18 +178,29 @@ class Covariance(LocalLinear):
         x = np.hstack([np.ones(time_diff.shape[0], dtype=np.float32).reshape(-1, 1), time_diff])
         return x, weights
     
+    def _get_design_matrix2(self, time, t, bw):
+        """
+        local quadratic
+        
+        """
+        time_diff = time - t
+        weights = self._gau_kernel(time_diff / bw) * self.time_comb_count
+        time_diff[:, 1] = time_diff[:, 1] ** 2
+        x = np.hstack([np.ones(time_diff.shape[0], dtype=np.float32).reshape(-1, 1), time_diff])
+        return x, weights
+    
     def estimate(self, bw):
-        cov_function = np.zeros((self.n_ldrs, self.n_time, self.n_time), dtype=np.float32)
+        # cov_function = np.zeros((self.n_ldrs, self.n_time, self.n_time), dtype=np.float32)
         grid_cov_function = np.zeros((self.n_ldrs, 51, 51), dtype=np.float32)
 
-        for t1 in range(self.n_time):
-            for t2 in range(t1, self.n_time):
-                x, weights = self._get_design_matrix(self.unique_time[t1], self.unique_time[t2], bw)
-                cov_function[:, t1, t2] = self._wls(x, self.mean_ldrs, weights)
+        # for t1 in range(self.n_time):
+        #     for t2 in range(t1, self.n_time):
+        #         x, weights = self._get_design_matrix(self.unique_time[t1], self.unique_time[t2], bw)
+        #         cov_function[:, t1, t2] = self._wls(x, self.mean_ldrs, weights)
         
-        iu_rows, iu_cols = np.triu_indices(self.n_time, k=1)
-        for i in range(self.n_ldrs):
-            cov_function[i][(iu_cols, iu_rows)] = cov_function[i][(iu_rows, iu_cols)]
+        # iu_rows, iu_cols = np.triu_indices(self.n_time, k=1)
+        # for i in range(self.n_ldrs):
+        #     cov_function[i][(iu_cols, iu_rows)] = cov_function[i][(iu_rows, iu_cols)]
 
         for t1 in range(51):
             for t2 in range(t1, 51):
@@ -189,7 +211,25 @@ class Covariance(LocalLinear):
         for i in range(self.n_ldrs):
             grid_cov_function[i][(iu_cols, iu_rows)] = grid_cov_function[i][(iu_rows, iu_cols)]
 
-        return cov_function, grid_cov_function
+        cut_time_grid = self.time_grid[
+            (self.time_grid > np.quantile(self.time_grid, 0.25)) & 
+            (self.time_grid < np.quantile(self.time_grid, 0.75))
+        ]
+        cut_time_grid = np.tile(cut_time_grid.reshape(-1, 1), 2)
+        n_cut_time_grid = cut_time_grid.shape[0]
+        rotation_matrix = np.array([[1, 1], [-1, 1]]).T * (np.sqrt(2) / 2)
+        rotated_time_comb = np.dot(self.unique_time_comb, rotation_matrix)
+        rotated_cut_time_grid = np.dot(cut_time_grid, rotation_matrix)
+        cut_time_grid_diag = np.zeros((self.n_ldrs, n_cut_time_grid), dtype=np.float32)
+        for t in range(n_cut_time_grid):
+            x, weights = self._get_design_matrix2(
+                rotated_time_comb, 
+                rotated_cut_time_grid[t],
+                0.1
+            )
+            cut_time_grid_diag[:, t] = self._wls(x, self.mean_ldrs, weights)
+
+        return grid_cov_function, cut_time_grid_diag
     
 
 class ResidualVariance(LocalLinear):
@@ -201,25 +241,36 @@ class ResidualVariance(LocalLinear):
         x = np.hstack([np.ones_like(time_diff), time_diff])
         return x, weights
     
-    def estimate(self, mean, time_idx, bw):
+    def estimate(self, mean, diag, time_idx, bw):
         one_way_mean = mean[0, time_idx].reshape(-1, 1)
-        resid_var = np.zeros((self.n_time, self.n_ldrs), dtype=np.float32)
+        resid_var = np.zeros(self.n_ldrs, dtype=np.float32)
         grid_resid_var = np.zeros((51, self.n_ldrs), dtype=np.float32)
 
-        for i, t in enumerate(self.unique_time):
-            x, weights = self._get_design_matrix(t, bw)
-            resid_var[i] = self._wls(x, (self.ldrs - one_way_mean)**2, weights)
-        resid_var = resid_var.T
+        # for i, t in enumerate(self.unique_time):
+        #     x, weights = self._get_design_matrix(t, bw)
+        #     resid_var[i] = self._wls(x, (self.ldrs - one_way_mean)**2, weights)
+        # resid_var = resid_var.T
 
         for i, t in enumerate(self.time_grid):
             x, weights = self._get_design_matrix(t, bw)
             grid_resid_var[i] = self._wls(x, (self.ldrs - one_way_mean)**2, weights)
         grid_resid_var = grid_resid_var.T
 
-        return resid_var, grid_resid_var
+        cut_time_grid = self.time_grid[
+            (self.time_grid > np.quantile(self.time_grid, 0.25)) & 
+            (self.time_grid < np.quantile(self.time_grid, 0.75))
+        ]
+        grid_resid_var = grid_resid_var[:, 
+            (self.time_grid > np.quantile(self.time_grid, 0.25)) & 
+            (self.time_grid < np.quantile(self.time_grid, 0.75))
+        ]
+        for i in range(self.n_ldrs):
+            resid_var[i] = traz(cut_time_grid, (grid_resid_var[i] - diag[i])) / 0.5
+
+        return resid_var
     
 
-def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
+def pace(ldrs, sub_time, unique_time, unique_time_map, time_grid, grid_mean, grid_cov, resid_var):
     """
     PACE estimator for time LDRs
 
@@ -227,10 +278,13 @@ def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
     ------------
     ldrs (n_obs, n_ldrs): a np.array of ldrs in long format 
     sub_time: a dictionary of sub:time, where sub should start with 0
+    unique_time: 
     unique_time_map: a dictionary of mapping time to index
-    mean (n_ldrs, n_time): a np.array of mean estimate
-    cov (n_ldrs, n_time, n_time): a np.array of cov estimate
-    resid_var (n_ldrs, n_time): a np.array of resid var estimate
+    time_grid: 
+    mean: 
+    grid_mean (n_ldrs, 51): a np.array of mean estimate
+    grid_cov (n_ldrs, 51, 51): a np.array of cov estimate
+    resid_var (n_ldrs, ): a np.array of resid var estimate
 
     Returns:
     ---------
@@ -238,33 +292,53 @@ def pace(ldrs, sub_time, unique_time_map, mean, cov, resid_var):
     
     """
     n_sub = len(sub_time)
-    n_ldrs, n_time = mean.shape
+    n_time = len(unique_time_map)
+    n_ldrs = grid_mean.shape[0]
     time_spatial_ldrs = np.zeros((n_ldrs, n_sub, n_time), dtype=np.float32)
     recon_spatial_ldrs = np.zeros((n_ldrs, n_sub, n_time), dtype=np.float32)
     eg_values = np.zeros((n_ldrs, n_time), dtype=np.float32)
     eg_vectors = np.zeros((n_ldrs, n_time, n_time), dtype=np.float32)
 
+    unique_time = unique_time / np.max(unique_time)
+    time_grid = time_grid / np.max(time_grid)
+
     for i in range(n_ldrs):
-        eg_values_, eg_vectors_ = np.linalg.eigh(cov[i])
+        eg_values_, eg_vectors_ = np.linalg.eigh(grid_cov[i])
         eg_values_ = np.flip(eg_values_) # (n_time, )
         eg_vectors_ = np.flip(eg_vectors_, axis=1) # (n_time, n_time)
-        eg_values[i] = eg_values_
-        eg_vectors[i] = eg_vectors_
-        eg_vectors_ = eg_vectors_ * eg_values_
+        eg_vectors_ = eg_vectors_[:, eg_values_ > 0]
+        eg_values_ = eg_values_[eg_values_ > 0]
         
+        fve = np.cumsum(eg_values_) / np.sum(eg_values_)
+        n_opt = np.min([n_time, np.argmax(fve > 0.98) + 1])
+        eg_values_ = eg_values_[:n_opt] * 0.02
+        eg_vectors_ = eg_vectors_[:, :n_opt]
+        interp_eg_vectors_ = np.zeros((n_time, n_opt), dtype=np.float32)
+
+        for j in range(n_opt):
+            eg_vectors_[:, j] = eg_vectors_[:, j] / np.sqrt(traz(time_grid, eg_vectors_[:, j] ** 2))
+            if np.sum(eg_vectors_[:, j] * grid_mean[i]):
+                eg_vectors_[:, j] = -eg_vectors_[:, j]
+            interp_eg_vectors_[:, j] = np.interp(unique_time, time_grid, eg_vectors_[:, j])
+        eg_values[i, :n_opt] = eg_values_
+        eg_vectors[i, :, :n_opt] = interp_eg_vectors_
+
+        fitted_cov = np.dot(interp_eg_vectors_ * eg_values_, interp_eg_vectors_.T)
+        fitted_cov += np.diag([resid_var[i]] * n_time)
+        interp_eg_vectors_ = interp_eg_vectors_ * eg_values_
         start, end = 0, 0
         for sub_idx, (_, time) in enumerate(sub_time.items()):
             end += len(time)
             time_idx = np.array([unique_time_map.get(t, 0) for t in time])
             y_i = ldrs[start: end, i] # (n_time_i, )
             # mu_i = mean[i, time_idx] # (n_time_i, )
-            Sigma_i_inv = np.linalg.inv(cov[i, time_idx, time_idx] + np.diag(resid_var[i, time_idx])) # (n_time_i, n_time_i)
-            eg_vector = eg_vectors_[time_idx] # (n_time_i, n_time)
-            time_spatial_ldrs[i, sub_idx] = np.dot(np.dot(eg_vector.T, Sigma_i_inv), y_i)
+            Sigma_i_inv = np.linalg.inv(fitted_cov[time_idx][:, time_idx]) # (n_time_i, n_time_i)
+            eg_vector = interp_eg_vectors_[time_idx] # (n_time_i, n_time)
+            time_spatial_ldrs[i, sub_idx, :n_opt] = np.dot(np.dot(eg_vector.T, Sigma_i_inv), y_i)
             start = end
         
         # do reconstruction for time
-        recon_spatial_ldrs[i] = np.dot(time_spatial_ldrs[i], eg_vectors[i].T)
+        recon_spatial_ldrs[i] = np.dot(time_spatial_ldrs[i, :, :n_opt], eg_vectors[i, :, :n_opt].T)
         recon_spatial_ldrs = recon_spatial_ldrs.transpose(2, 1, 0)
 
     return recon_spatial_ldrs
@@ -427,7 +501,9 @@ def run(args, log):
     unique_time = np.unique(time)
     unique_time_idx = {x: i for i, x in enumerate(unique_time)}
     time_idx = np.array([unique_time_idx[x] for x in time])
-    ids = ldrs.data.index
+    grid_size = (unique_time[-1] - unique_time[0]) / 50
+    time_grid = np.arange(unique_time[0], unique_time[-1] + grid_size, grid_size)
+    ids = covar.data.index
     ldrs.to_single_index()
     n_obs = ldrs.data.index.value_counts(sort=False).values
 
@@ -435,24 +511,27 @@ def run(args, log):
     mean, grid_mean = mean_estimator.estimate(0.1)
     
     cov_estimator = Covariance(ldrs_data, time, n_obs, mean, time_idx)
-    cov, grid_cov = cov_estimator.estimate(0.1)
+    grid_cov, cut_time_grid_diag = cov_estimator.estimate(0.1)
 
     resid_var_estimator = ResidualVariance(ldrs_data, time, n_obs)
-    resid_var, grid_resid_var = resid_var_estimator.estimate(mean, time_idx, 0.1)
+    resid_var = resid_var_estimator.estimate(
+        mean, cut_time_grid_diag, time_idx, 0.1
+    )
 
     # PACE
     sub_time = ldrs.data.groupby("IID")["time"].apply(list).to_dict()
     unique_time_map = {t: i for i, t in enumerate(unique_time)}
-    recon_spatial_ldrs = pace(ldrs_data, sub_time, unique_time_map, mean, cov, resid_var)
+    recon_spatial_ldrs = pace(
+        ldrs_data, sub_time, unique_time, unique_time_map, time_grid, grid_mean, grid_cov, resid_var
+    )
 
     # cov matrix of LDRs for each time
     ldr_cov_matrix = ldr_cov(recon_spatial_ldrs, np.array(covar.data))
 
     # save
-    utf8_dt = h5py.string_dtype(encoding='utf-8')
     with h5py.File(f"{args.out}_recon_ldrs.h5", 'w') as file:
         file.create_dataset("ldrs", data=recon_spatial_ldrs, dtype="float32")
-        file.create_dataset("id", data=np.array(ids.tolist()), dtype=utf8_dt)
+        file.create_dataset("id", data=np.array(ids.tolist(), dtype="S10"))
         file.create_dataset("time", data=unique_time)
 
     np.save(f"{args.out}_ldr_cov.npy", ldr_cov_matrix)
